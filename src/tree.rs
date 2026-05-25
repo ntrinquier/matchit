@@ -59,11 +59,23 @@ pub(crate) enum NodeType {
     /// complexity.
     Param { suffix: bool },
 
-    /// A catch-all parameter, e.g. '/{*file}'.
-    CatchAll,
+    /// A catch-all parameter, e.g. '/{*file}' or '/{*file}/info'.
+    /// The inner kind stores whether matching stops here, or resumes at a
+    /// child node.
+    CatchAll(CatchAllKind),
 
     /// A static prefix, e.g. '/foo'.
     Static,
+}
+
+/// Whether a [`NodeType::CatchAll`] consumes the rest of the path or resumes matching later.
+#[derive(PartialEq, Eq, PartialOrd, Ord, Debug, Clone, Copy)]
+pub(crate) enum CatchAllKind {
+    /// Captures the rest of the path, e.g. '/{*file}'.
+    Terminal,
+
+    /// Captures until a following route boundary, e.g. '/{*file}/info'.
+    NonTerminal,
 }
 
 /// Safety: We expose `value` per Rust's usual borrowing rules, so we can just
@@ -306,7 +318,7 @@ impl<T> Node<T> {
             //
             // If we're not inserting a wildcard we have to create a static child.
             if (next != b'{' || remaining.is_escaped(0))
-                && state.node().node_type != NodeType::CatchAll
+                && !matches!(state.node().node_type, NodeType::CatchAll(_))
             {
                 let node = state.node_mut();
 
@@ -350,14 +362,10 @@ impl<T> Node<T> {
                 state.node_mut().priority += 1;
 
                 // Make sure the route parameter matches.
-                if let Some(wildcard) = remaining.get(..state.node().prefix.len()) {
-                    if *wildcard != *state.node().prefix {
-                        return Err(InsertError::conflict(&route, remaining, state.node()));
-                    }
-                }
-
-                // Catch-all routes cannot have children.
-                if state.node().node_type == NodeType::CatchAll {
+                if remaining
+                    .get(..state.node().prefix.len())
+                    .map_or(true, |wildcard| *wildcard != *state.node().prefix)
+                {
                     return Err(InsertError::conflict(&route, remaining, state.node()));
                 }
 
@@ -479,27 +487,60 @@ impl<T> Node<T> {
 
             // Inserting a catch-all route.
             if prefix[wildcard.clone()][1] == b'*' {
-                // Ensure there is no suffix after the parameter, e.g. `/foo/{*x}/bar`.
-                if wildcard.end != prefix.len() {
-                    return Err(InsertError::InvalidCatchAll);
-                }
-
                 // Add the prefix before the wildcard into the current node.
                 if wildcard.start > 0 {
                     node.prefix = prefix.slice_until(wildcard.start).to_owned();
                     prefix = prefix.slice_off(wildcard.start);
                 }
 
-                // Add the catch-all as a child node.
+                let wildcard = prefix.slice_until(wildcard.len());
+                prefix = prefix.slice_off(wildcard.len());
+
+                if prefix.is_empty() {
+                    // Terminal catch-alls keep the value directly on the catch-all node
+                    // and consume the rest of the path during matching.
+                    let child = node.add_child(Node {
+                        prefix: wildcard.to_owned(),
+                        node_type: NodeType::CatchAll(CatchAllKind::Terminal),
+                        value: Some(UnsafeCell::new(val)),
+                        priority: 1,
+                        ..Node::default()
+                    });
+                    node.wild_child = true;
+                    return Ok(&mut node.children[child]);
+                }
+
+                // Non-terminal catch-alls are only delimited by complete path
+                // segments. Same-segment suffixes, e.g. `/{*path}.json`, would
+                // make the capture boundary ambiguous with the current tree shape.
+                if prefix[0] != b'/' {
+                    return Err(InsertError::InvalidCatchAll);
+                }
+
+                // Store the catch-all as an intermediate wildcard node and keep
+                // inserting the remaining static path below it. At match time, the
+                // static child prefix is used as the boundary for the catch-all.
                 let child = node.add_child(Node {
-                    prefix: prefix.to_owned(),
-                    node_type: NodeType::CatchAll,
-                    value: Some(UnsafeCell::new(val)),
+                    prefix: wildcard.to_owned(),
+                    node_type: NodeType::CatchAll(CatchAllKind::NonTerminal),
                     priority: 1,
                     ..Node::default()
                 });
                 node.wild_child = true;
-                return Ok(&mut node.children[child]);
+                node = &mut node.children[child];
+
+                // If there is a static segment after the catch-all, setup the node
+                // for the rest of the route.
+                if prefix[0] != b'{' || prefix.is_escaped(0) {
+                    node.indices.push(prefix[0]);
+                    let child = node.add_child(Node {
+                        priority: 1,
+                        ..Node::default()
+                    });
+                    node = &mut node.children[child];
+                }
+
+                continue;
             }
 
             // Otherwise, we're inserting a regular route parameter.
@@ -809,7 +850,7 @@ impl<T> Node<T> {
                         // Found the matching value.
                         if let Some(ref value) = node.value {
                             // Remap the keys of any route parameters we accumulated during the search.
-                            params.for_each_key_mut(|(i, param)| param.key = &node.remapping[i]);
+                            remap_params(&mut params, &node.remapping);
                             return Ok((value, params));
                         }
                     }
@@ -884,8 +925,7 @@ impl<T> Node<T> {
                                 params.push(b"", path);
 
                                 // Remap the keys of any route parameters we accumulated during the search.
-                                params
-                                    .for_each_key_mut(|(i, param)| param.key = &node.remapping[i]);
+                                remap_params(&mut params, &node.remapping);
 
                                 return Ok((value, params));
                             }
@@ -956,14 +996,14 @@ impl<T> Node<T> {
                         params.push(b"", path);
 
                         // Remap the keys of any route parameters we accumulated during the search.
-                        params.for_each_key_mut(|(i, param)| param.key = &node.remapping[i]);
+                        remap_params(&mut params, &node.remapping);
 
                         return Ok((value, params));
                     }
 
-                    NodeType::CatchAll => {
-                        // Catch-all segments are only allowed at the end of the route, meaning
-                        // this node must contain the value.
+                    NodeType::CatchAll(CatchAllKind::Terminal) => {
+                        // Terminal catch-all segments are at the end of the
+                        // route, meaning this node must contain the value.
                         let value = match node.value {
                             // Found the matching value.
                             Some(ref value) => value,
@@ -973,13 +1013,37 @@ impl<T> Node<T> {
                         };
 
                         // Remap the keys of any route parameters we accumulated during the search.
-                        params.for_each_key_mut(|(i, param)| param.key = &node.remapping[i]);
+                        remap_params(&mut params, &node.remapping);
 
                         // Store the final catch-all parameter (`{*...}`).
                         let key = &node.prefix[2..node.prefix.len() - 1];
                         params.push(key, path);
 
                         return Ok((value, params));
+                    }
+
+                    NodeType::CatchAll(CatchAllKind::NonTerminal) => {
+                        // A non-terminal catch-all must leave "enough" path
+                        // for one of its children to match. The child prefix
+                        // marks the point where the catch-all capture stops.
+                        if let Some((child, boundary)) = node.children.iter().find_map(|child| {
+                            find_wildcard_boundary(path, child)
+                                // Empty catch-all parameters do not match.
+                                .filter(|&boundary| boundary != 0)
+                                .map(|boundary| (child, boundary))
+                        }) {
+                            // Capture everything before the chosen boundary,
+                            // then resume matching at the child node with the
+                            // boundary still present in `path`.
+                            let key = &node.prefix[2..node.prefix.len() - 1];
+                            params.push(key, &path[..boundary]);
+                            path = &path[boundary..];
+                            node = child;
+                            backtracking = false;
+                            continue 'walk;
+                        }
+
+                        break 'walk;
                     }
 
                     _ => unreachable!(),
@@ -1023,6 +1087,37 @@ impl<T> Node<T> {
     }
 }
 
+/// Finds the position where a non-terminal catch-all should stop capturing.
+///
+/// `child` is the route node that follows the catch-all. Its prefix is the boundary marker,
+/// such as `/blobs/` in `/v2/{*name}/blobs/{digest}`. The search proceeds from the end
+/// of `path` so captures are greedy, but a boundary is only accepted if the child can
+/// plausibly continue matching after its prefix. That avoids stopping at an earlier repeated
+/// marker in paths like `/v2/a/blobs/b/blobs/sha256:abc`.
+fn find_wildcard_boundary<T>(path: &[u8], child: &Node<T>) -> Option<usize> {
+    let boundary = child.prefix.as_ref();
+
+    if boundary.is_empty() || path.len() < boundary.len() {
+        return None;
+    }
+
+    (0..=path.len() - boundary.len()).rev().find(|&i| {
+        if !path[i..].starts_with(&boundary) {
+            return false;
+        }
+
+        // Do not accept a repeated boundary unless the child could match what follows it.
+        // This keeps `/v2/{*name}/blobs/{digest}` greedy for paths containing `blobs`
+        // inside `{*name}`.
+        let rest = &path[i + boundary.len()..];
+        rest.is_empty() && child.value.is_some()
+            || rest
+                .first()
+                .map_or(false, |next| child.indices.contains(next))
+            || !rest.is_empty() && child.wild_child
+    })
+}
+
 /// An ordered list of route parameters keys for a specific route.
 ///
 /// To support conflicting routes like `/{a}/foo` and `/{b}/bar`, route parameters
@@ -1030,6 +1125,16 @@ impl<T> Node<T> {
 /// stored at nodes containing values, containing the "true" names of all route parameters
 /// for the given route.
 type ParamRemapping = Vec<Vec<u8>>;
+
+fn remap_params<'node, 'path>(params: &mut Params<'node, 'path>, remapping: &'node ParamRemapping) {
+    let mut next = 0;
+    params.for_each_key_mut(|(_, param)| {
+        if param.key.is_empty() {
+            param.key = &remapping[next];
+            next += 1;
+        }
+    });
+}
 
 /// Returns `path` with normalized route parameters, and a parameter remapping
 /// to store at the node for this route.

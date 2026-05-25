@@ -554,6 +554,123 @@ fn catchall_overlap() {
 }
 
 #[test]
+fn non_terminal_catchalls() {
+    MatchTest {
+        routes: vec![
+            "/v2/{*name}/",
+            "/v2/{*name}/blobs/{digest}",
+            "/v2/{*name}/manifests/{reference}",
+        ],
+        matches: vec![
+            (
+                "/v2/library/ubuntu/",
+                "/v2/{*name}/",
+                p! { "name" => "library/ubuntu" },
+            ),
+            (
+                "/v2/library/ubuntu/blobs/sha256:abc",
+                "/v2/{*name}/blobs/{digest}",
+                p! { "name" => "library/ubuntu", "digest" => "sha256:abc" },
+            ),
+            (
+                "/v2/team/project/image/manifests/latest",
+                "/v2/{*name}/manifests/{reference}",
+                p! { "name" => "team/project/image", "reference" => "latest" },
+            ),
+            (
+                "/v2/library/blobs/sha256:abc",
+                "/v2/{*name}/blobs/{digest}",
+                p! { "name" => "library", "digest" => "sha256:abc" },
+            ),
+            (
+                "/v2/blobs/blobs/sha256:abc",
+                "/v2/{*name}/blobs/{digest}",
+                p! { "name" => "blobs", "digest" => "sha256:abc" },
+            ),
+            (
+                "/v2/ubuntu/blobs/sha256:abc",
+                "/v2/{*name}/blobs/{digest}",
+                p! { "name" => "ubuntu", "digest" => "sha256:abc" },
+            ),
+            ("/v2/library/ubuntu/tags/list", "", Err(())),
+        ],
+    }
+    .run();
+}
+
+#[test]
+fn multiple_non_terminal_catchalls() {
+    MatchTest {
+        routes: vec!["/api/{*namespace}/repos/{*name}/manifests/{reference}"],
+        matches: vec![
+            (
+                "/api/org/team/repos/library/ubuntu/manifests/latest",
+                "/api/{*namespace}/repos/{*name}/manifests/{reference}",
+                p! { "namespace" => "org/team", "name" => "library/ubuntu", "reference" => "latest" },
+            ),
+            (
+                "/api/repos/repos/library/ubuntu/manifests/latest",
+                "/api/{*namespace}/repos/{*name}/manifests/{reference}",
+                p! { "namespace" => "repos", "name" => "library/ubuntu", "reference" => "latest" },
+            ),
+            (
+                "/api/org/team/repos/manifests/manifests/latest",
+                "/api/{*namespace}/repos/{*name}/manifests/{reference}",
+                p! { "namespace" => "org/team", "name" => "manifests", "reference" => "latest" },
+            ),
+            (
+                "/api/repos/repos/manifests/manifests/latest",
+                "/api/{*namespace}/repos/{*name}/manifests/{reference}",
+                p! { "namespace" => "repos", "name" => "manifests", "reference" => "latest" },
+            ),
+            (
+                "/api/org/repos/repos/library/repos/ubuntu/manifests/latest",
+                "/api/{*namespace}/repos/{*name}/manifests/{reference}",
+                p! { "namespace" => "org/repos/repos/library", "name" => "ubuntu", "reference" => "latest" },
+            ),
+            ("/api/org/team/repos/library/ubuntu/tags/list", "", Err(())),
+        ],
+    }
+    .run();
+}
+
+#[test]
+fn multiple_non_terminal_catchalls_with_terminal_catchall() {
+    MatchTest {
+        routes: vec!["/api/{*namespace}/repos/{*name}/blobs/{*digest}"],
+        matches: vec![
+            (
+                "/api/org/team/repos/library/ubuntu/blobs/sha256/abc",
+                "/api/{*namespace}/repos/{*name}/blobs/{*digest}",
+                p! { "namespace" => "org/team", "name" => "library/ubuntu", "digest" => "sha256/abc" },
+            ),
+            (
+                "/api/repos/repos/library/ubuntu/blobs/sha256/abc",
+                "/api/{*namespace}/repos/{*name}/blobs/{*digest}",
+                p! { "namespace" => "repos", "name" => "library/ubuntu", "digest" => "sha256/abc" },
+            ),
+            (
+                "/api/org/team/repos/blobs/blobs/sha256/abc",
+                "/api/{*namespace}/repos/{*name}/blobs/{*digest}",
+                p! { "namespace" => "org/team", "name" => "blobs", "digest" => "sha256/abc" },
+            ),
+            (
+                "/api/repos/repos/blobs/blobs/sha256/abc",
+                "/api/{*namespace}/repos/{*name}/blobs/{*digest}",
+                p! { "namespace" => "repos", "name" => "blobs", "digest" => "sha256/abc" },
+            ),
+            (
+                "/api/org/repos/repos/library/repos/ubuntu/blobs/sha256/abc",
+                "/api/{*namespace}/repos/{*name}/blobs/{*digest}",
+                p! { "namespace" => "org/repos/repos/library", "name" => "ubuntu", "digest" => "sha256/abc" },
+            ),
+            ("/api/org/team/repos/library/ubuntu/tags/list", "", Err(())),
+        ],
+    }
+    .run();
+}
+
+#[test]
 fn escaped() {
     MatchTest {
         routes: vec![
