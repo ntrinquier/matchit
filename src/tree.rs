@@ -812,18 +812,44 @@ impl<T> Node<T> {
     }
 }
 
-/// A wildcard node that was skipped during a tree search.
+/// A backtrack record captured during a tree search.
 ///
-/// Contains the state necessary to backtrack to the given node.
-struct Skipped<'node, 'path, T> {
-    // The node that was skipped.
-    node: &'node Node<T>,
+/// Contains the state necessary to resume the search from an alternative branch.
+enum Skipped<'node, 'path, T> {
+    /// A wildcard node that was skipped in favor of a matching static child.
+    ///
+    /// We may end up needing to backtrack to the wildcard if the static branch
+    /// does not lead to a match.
+    Wild {
+        // The node that was skipped.
+        node: &'node Node<T>,
 
-    /// The path at the time we skipped this node.
-    path: &'path [u8],
+        /// The path at the time we skipped this node.
+        path: &'path [u8],
 
-    // The number of parameters that were present.
-    params: usize,
+        // The number of parameters that were present.
+        params: usize,
+    },
+
+    /// A non-terminal catch-all node that committed to a particular boundary.
+    ///
+    /// The catch-all greedily captures up to the largest boundary that plausibly
+    /// allows a child to match. If that boundary leads to a dead end, we need to
+    /// resume here and try the next-shorter boundary.
+    CatchAllBoundary {
+        /// The catch-all node.
+        node: &'node Node<T>,
+
+        /// The full path at the catch-all node, including the captured segment.
+        path: &'path [u8],
+
+        // The number of parameters that were present before the catch-all capture.
+        params: usize,
+
+        /// The boundary that was committed to. The next attempt must find a
+        /// boundary strictly less than this.
+        boundary: usize,
+    },
 }
 
 impl<T> Node<T> {
@@ -881,7 +907,7 @@ impl<T> Node<T> {
                         // We may end up needing to backtrack later in case we do not find a
                         // match.
                         if node.wild_child {
-                            skipped.push(Skipped {
+                            skipped.push(Skipped::Wild {
                                 node,
                                 path: previous,
                                 params: params.len(),
@@ -1026,12 +1052,23 @@ impl<T> Node<T> {
                         // A non-terminal catch-all must leave "enough" path
                         // for one of its children to match. The child prefix
                         // marks the point where the catch-all capture stops.
-                        if let Some((child, boundary)) = node.children.iter().find_map(|child| {
-                            find_wildcard_boundary(path, child)
-                                // Empty catch-all parameters do not match.
-                                .filter(|&boundary| boundary != 0)
-                                .map(|boundary| (child, boundary))
-                        }) {
+                        //
+                        // The greediest plausible boundary may still lead to a
+                        // dead end (the one-byte child heuristic is not exact),
+                        // so we record a backtrack entry to resume here and try
+                        // the next-shorter boundary if the chosen branch fails.
+                        if let Some((child, boundary)) =
+                            find_wildcard_boundary(path, node, usize::MAX)
+                        {
+                            // Record a way to resume at this catch-all and try
+                            // a strictly shorter boundary on failure.
+                            skipped.push(Skipped::CatchAllBoundary {
+                                node,
+                                path,
+                                params: params.len(),
+                                boundary,
+                            });
+
                             // Capture everything before the chosen boundary,
                             // then resume matching at the child node with the
                             // boundary still present in `path`.
@@ -1050,16 +1087,53 @@ impl<T> Node<T> {
                 }
             }
 
-            // Try backtracking to any matching wildcard nodes that we skipped while
+            // Try backtracking to any alternative branches that we skipped while
             // traversing the tree.
-            while let Some(skipped) = skipped.pop() {
-                if skipped.path.ends_with(path) {
-                    // Found a matching node, restore the search state.
-                    path = skipped.path;
-                    node = skipped.node;
-                    backtracking = true;
-                    params.truncate(skipped.params);
-                    continue 'backtrack;
+            while let Some(skip) = skipped.pop() {
+                match skip {
+                    Skipped::Wild {
+                        node: skip_node,
+                        path: skip_path,
+                        params: skip_params,
+                    } => {
+                        if skip_path.ends_with(path) {
+                            // Found a matching node, restore the search state.
+                            path = skip_path;
+                            node = skip_node;
+                            backtracking = true;
+                            params.truncate(skip_params);
+                            continue 'backtrack;
+                        }
+                    }
+
+                    Skipped::CatchAllBoundary {
+                        node: skip_node,
+                        path: skip_path,
+                        params: skip_params,
+                        boundary,
+                    } => {
+                        // Try the next-shorter boundary at this catch-all node.
+                        if let Some((child, next_boundary)) =
+                            find_wildcard_boundary(skip_path, skip_node, boundary)
+                        {
+                            // Restore state to the catch-all and commit to the
+                            // shorter boundary, recording the next attempt.
+                            params.truncate(skip_params);
+                            skipped.push(Skipped::CatchAllBoundary {
+                                node: skip_node,
+                                path: skip_path,
+                                params: skip_params,
+                                boundary: next_boundary,
+                            });
+
+                            let key = &skip_node.prefix[2..skip_node.prefix.len() - 1];
+                            params.push(key, &skip_path[..next_boundary]);
+                            path = &skip_path[next_boundary..];
+                            node = child;
+                            backtracking = false;
+                            continue 'backtrack;
+                        }
+                    }
                 }
             }
 
@@ -1089,32 +1163,51 @@ impl<T> Node<T> {
 
 /// Finds the position where a non-terminal catch-all should stop capturing.
 ///
-/// `child` is the route node that follows the catch-all. Its prefix is the boundary marker,
-/// such as `/blobs/` in `/v2/{*name}/blobs/{digest}`. The search proceeds from the end
-/// of `path` so captures are greedy, but a boundary is only accepted if the child can
+/// `node` is the catch-all node; each of its children's prefixes is a candidate boundary
+/// marker, such as `/blobs/` in `/v2/{*name}/blobs/{digest}`. The search proceeds from the
+/// end of `path` so captures are greedy, but a boundary is only accepted if the child can
 /// plausibly continue matching after its prefix. That avoids stopping at an earlier repeated
 /// marker in paths like `/v2/a/blobs/b/blobs/sha256:abc`.
-fn find_wildcard_boundary<T>(path: &[u8], child: &Node<T>) -> Option<usize> {
-    let boundary = child.prefix.as_ref();
+///
+/// The one-byte plausibility check is a heuristic, not a full subtree match, so the greediest
+/// candidate may still lead to a dead end. `max_boundary` lets callers resume the search:
+/// only boundaries strictly less than `max_boundary` are considered, so a failed branch can
+/// be retried with the next-shorter boundary. Pass `usize::MAX` for the initial (greediest)
+/// search.
+///
+/// Returns the matching child together with the chosen boundary, where the boundary is the
+/// number of bytes the catch-all captures (never zero, as empty captures do not match).
+fn find_wildcard_boundary<'node, T>(
+    path: &[u8],
+    node: &'node Node<T>,
+    max_boundary: usize,
+) -> Option<(&'node Node<T>, usize)> {
+    node.children.iter().find_map(|child| {
+        let boundary = child.prefix.as_ref();
 
-    if boundary.is_empty() || path.len() < boundary.len() {
-        return None;
-    }
-
-    (0..=path.len() - boundary.len()).rev().find(|&i| {
-        if !path[i..].starts_with(&boundary) {
-            return false;
+        if boundary.is_empty() || path.len() < boundary.len() {
+            return None;
         }
 
-        // Do not accept a repeated boundary unless the child could match what follows it.
-        // This keeps `/v2/{*name}/blobs/{digest}` greedy for paths containing `blobs`
-        // inside `{*name}`.
-        let rest = &path[i + boundary.len()..];
-        rest.is_empty() && child.value.is_some()
-            || rest
-                .first()
-                .map_or(false, |next| child.indices.contains(next))
-            || !rest.is_empty() && child.wild_child
+        let start = (path.len() - boundary.len()).min(max_boundary.saturating_sub(1));
+
+        (1..=start).rev().find_map(|i| {
+            if !path[i..].starts_with(&boundary) {
+                return None;
+            }
+
+            // Do not accept a repeated boundary unless the child could match what follows it.
+            // This keeps `/v2/{*name}/blobs/{digest}` greedy for paths containing `blobs`
+            // inside `{*name}`.
+            let rest = &path[i + boundary.len()..];
+            let plausible = rest.is_empty() && child.value.is_some()
+                || rest
+                    .first()
+                    .map_or(false, |next| child.indices.contains(next))
+                || !rest.is_empty() && child.wild_child;
+
+            plausible.then_some((child, i))
+        })
     })
 }
 
